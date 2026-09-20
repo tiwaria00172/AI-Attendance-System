@@ -79,8 +79,16 @@ ATTENDANCE_COLUMNS = [
 # Cosine similarity threshold
 MATCH_THRESHOLD = 0.45
 
+# YuNet face-detection settings
+DETECTION_SCORE_THRESHOLD = 0.65
+DETECTION_NMS_THRESHOLD = 0.30
+DETECTION_TOP_K = 5000
+
+# Multi-scale detection helps with small faces in larger/group photos.
+DETECTION_SCALES = (1.0, 1.25)
+
 # Maximum image width for processing
-MAX_IMAGE_WIDTH = 960
+MAX_IMAGE_WIDTH = 1280
 
 
 # ============================================================
@@ -210,9 +218,9 @@ def load_models():
         str(YUNET_MODEL),
         "",
         (320, 320),
-        0.9,
-        0.3,
-        5000
+        DETECTION_SCORE_THRESHOLD,
+        DETECTION_NMS_THRESHOLD,
+        DETECTION_TOP_K
     )
 
     recognizer = cv2.FaceRecognizerSF.create(
@@ -281,24 +289,171 @@ def bytes_to_cv2(uploaded_file):
 # FACE DETECTION
 # ============================================================
 
+def _iou(box_a, box_b):
+    """Intersection-over-Union for two [x, y, w, h] boxes."""
+    ax, ay, aw, ah = [float(v) for v in box_a[:4]]
+    bx, by, bw, bh = [float(v) for v in box_b[:4]]
+
+    ax2, ay2 = ax + max(0.0, aw), ay + max(0.0, ah)
+    bx2, by2 = bx + max(0.0, bw), by + max(0.0, bh)
+
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(0.0, aw) * max(0.0, ah)
+    area_b = max(0.0, bw) * max(0.0, bh)
+    union = area_a + area_b - inter
+
+    return inter / union if union > 0 else 0.0
+
+
+def _deduplicate_faces(faces, iou_threshold=0.45):
+    """
+    Remove duplicate/overlapping detections.
+
+    Multi-scale detection can return slightly different boxes for the same
+    physical face. IoU plus center-distance checks prevent one face from
+    being counted twice.
+    """
+    if faces is None or len(faces) == 0:
+        return []
+
+    ordered = sorted(
+        [np.asarray(face, dtype=np.float32) for face in faces],
+        key=lambda f: float(f[14]) if len(f) > 14 else 0.0,
+        reverse=True
+    )
+
+    kept = []
+    for face in ordered:
+        x, y, w, h = [float(v) for v in face[:4]]
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+
+        duplicate = False
+        for existing in kept:
+            ex, ey, ew, eh = [float(v) for v in existing[:4]]
+            ecx = ex + ew / 2.0
+            ecy = ey + eh / 2.0
+
+            iou = _iou(face, existing)
+
+            # If centers are very close relative to face size, these are
+            # almost certainly two detections of the same face.
+            distance = np.hypot(cx - ecx, cy - ecy)
+            reference = max(
+                1.0,
+                min((w + h) / 2.0, (ew + eh) / 2.0)
+            )
+
+            if iou >= iou_threshold or distance < reference * 0.35:
+                duplicate = True
+                break
+
+        if not duplicate:
+            kept.append(face)
+
+    return kept
+
+
+def _clahe_image(image):
+    """Improve local contrast without changing image dimensions."""
+    try:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
+        l_channel = clahe.apply(l_channel)
+
+        return cv2.cvtColor(
+            cv2.merge((l_channel, a_channel, b_channel)),
+            cv2.COLOR_LAB2BGR
+        )
+    except Exception:
+        return image
+
+
 def detect_faces(image, detector):
     """
-    Detect faces using YuNet.
-    """
+    Robust but conservative YuNet detection.
 
-    if image is None:
+    Strategy:
+    1. Detect on the original image first.
+    2. Only if no face is found, try a 1.25x image for small faces.
+    3. Only if still no face is found, try CLAHE for difficult lighting.
+
+    This avoids counting the same face multiple times because of separate
+    detection passes.
+    """
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return []
 
     height, width = image.shape[:2]
 
+    def run_detection(work, scale=1.0):
+        detector.setInputSize((work.shape[1], work.shape[0]))
+        _, faces = detector.detect(work)
+
+        if faces is None or len(faces) == 0:
+            return []
+
+        output = []
+        for face in faces:
+            f = np.asarray(face, dtype=np.float32).copy()
+
+            if scale != 1.0:
+                f[:14] /= scale
+
+            output.append(f)
+
+        return output
+
+    # Pass 1: original image
+    candidates = run_detection(image, 1.0)
+
+    # Pass 2: only if original detection failed
+    if not candidates:
+        scale = 1.25
+        upscaled = cv2.resize(
+            image,
+            (int(width * scale), int(height * scale)),
+            interpolation=cv2.INTER_CUBIC
+        )
+        candidates = run_detection(upscaled, scale)
+
+    # Pass 3: only if both previous passes failed
+    if not candidates:
+        enhanced = _clahe_image(image)
+        candidates = run_detection(enhanced, 1.0)
+
+    # Restore detector input size for future calls.
     detector.setInputSize((width, height))
 
-    _, faces = detector.detect(image)
+    cleaned = []
 
-    if faces is None:
-        return []
+    for face in candidates:
+        if len(face) < 4:
+            continue
 
-    return faces
+        x, y, w, h = [float(v) for v in face[:4]]
+
+        x1 = max(0, min(int(round(x)), width - 1))
+        y1 = max(0, min(int(round(y)), height - 1))
+        x2 = max(x1 + 1, min(int(round(x + w)), width))
+        y2 = max(y1 + 1, min(int(round(y + h)), height))
+
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        # Ignore extremely tiny detections that are usually noise.
+        if box_w >= 12 and box_h >= 12:
+            face[:4] = [x1, y1, box_w, box_h]
+            cleaned.append(face)
+
+    return _deduplicate_faces(cleaned)
 
 
 # ============================================================
@@ -727,7 +882,7 @@ def process_attendance_image(
 
     results = []
 
-    if not faces:
+    if faces is None or len(faces) == 0:
         return image, results
 
     for face in faces:
